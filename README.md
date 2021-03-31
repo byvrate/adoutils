@@ -1,2 +1,3 @@
-# adoutils
-Contains a collection of useful utilities to work with Azure DevOps.
+# Azure DevOps Utilities
+
+Contains various artifacts that might be helpful when working with Azure Devops. 
