@@ -1,0 +1,102 @@
+# common-gittag-steps.yml
+#
+# Description: 
+#   Steps template used to create an annotated Git tag for semantic versioning.
+#
+#   This template specifically creates a Git annotated tag from the pipeline using
+#   basic Git CLI commands which should work the same on Windows and Linux. It uses 
+#   the "script" task which is a shortcut that runs cmd.exe on Windows and Bash on other platforms.
+#
+#   see: https://docs.microsoft.com/en-us/azure/devops/pipelines/yaml-schema?view=azure-devops&tabs=schema%2Cparameter-schema#script
+#   see: https://git-scm.com/docs/git-tag#Documentation/git-tag.txt---annotate
+#   see: https://docs.microsoft.com/en-us/azure/devops/repos/git/git-tags?view=azure-devops&tabs=browser
+#
+#   Note: 
+#     persistCredentials must be set to true on the Job that's using this
+#     steps template. This will leave the OAuth token in the git tag step so the script has 
+#     permissions to set and commit an annotated tag.
+#     see: https://docs.microsoft.com/en-us/azure/devops/pipelines/yaml-schema?view=azure-devops&tabs=schema%2Cparameter-schema#checkout
+#
+#     This template supports both PowerShell Core and Bash. It queries the agent OS to determine which is run.
+#     
+# Parameters:
+#   serviceAccountName: string
+#     The user.name value in Git config. This value should be something that represents the 
+#     pipeline service account. 
+#     see: https://git-scm.com/docs/git-config#Documentation/git-config.txt-username
+#   serviceAccountEmail: string
+#     The user.email values in Git config. This value should be something that represents 
+#     the pipeline service account.
+#     see: https://git-scm.com/docs/git-config#Documentation/git-config.txt-useremail
+#   annotatedMessage: string
+#     Specifies a tagging message.
+#     see: https://git-scm.com/book/en/v2/Git-Basics-Tagging
+#   versionSemantic: string
+#     The Semantic Version.
+#   trunk: string
+#     The trunk branch in the repo. This is typically master or main. This 
+#     is to ensure we only tag off of the trunk branch.
+
+parameters: 
+- name: serviceAccountName
+  type: string
+- name: serviceAccountEmail
+  type: string
+- name: annotatedMessage
+  type: string
+- name: versionSemantic
+  type: string
+- name: trunk
+  type: string
+  default: 'refs/heads/master'
+
+steps:
+- bash: |
+    git config --global user.name "${{ parameters.serviceAccountName }}"
+    git config --global user.email "${{ parameters.serviceAccountEmail }}"
+    git tag -a $(Build.DefinitionName)-v${{ parameters.versionSemantic }} -m "${{ parameters.annotatedMessage }}"
+    if [ $? -ne 0 ]; then
+      echo "##vso[task.logissue type=error]Failed during git tag operation"
+      echo "##vso[task.complete result=Failed;]"
+    fi
+
+    git push origin $(Build.DefinitionName)-v${{ parameters.versionSemantic }}
+    if [ $? -ne 0 ]; then
+      echo "##vso[task.logissue type=error]Failed in git push operation"
+      echo "##vso[task.complete result=Failed;]"
+    fi
+
+    echo "##vso[task.setvariable variable=gitTagSemanticVersion;]$(Build.DefinitionName)-v${{ parameters.versionSemantic }}" 
+  displayName: Git Tag Semantic Version on Linux
+  condition: |
+    and
+    (
+      succeeded(),
+      eq( variables['Agent.OS'], 'Linux' ),
+      eq( variables['Build.SourceBranch'], '${{ parameters.trunk }}')
+    )
+
+- pwsh: |
+    git config --global user.name "${{ parameters.serviceAccountName }}"
+    git config --global user.email "${{ parameters.serviceAccountEmail }}"
+    git tag -a $(Build.DefinitionName)-v${{ parameters.versionSemantic }} -m "${{ parameters.annotatedMessage }}"
+    if ($LastExitCode -ne 0) {
+      Write-Host "##vso[task.logissue type=error]Failed during git tag operation"
+      Write-Host "##vso[task.complete result=Failed;]"
+    }
+
+    git push origin $(Build.DefinitionName)-v${{ parameters.versionSemantic }}
+    if ($LastExitCode -ne 0) {
+      Write-Host "##vso[task.logissue type=error]Failed in git push operation"
+      Write-Host "##vso[task.complete result=Failed;]"
+    }
+
+    echo "##vso[task.setvariable variable=gitTagSemanticVersion;]$(Build.DefinitionName)-v${{ parameters.versionSemantic }}" 
+  displayName: Git Tag Semantic Version on Windows_NT
+  condition: |
+    and
+    (
+      succeeded(),
+      eq( variables['Agent.OS'], 'Windows_NT' ),
+      eq( variables['Build.SourceBranch'], '${{ parameters.trunk }}')
+    )
