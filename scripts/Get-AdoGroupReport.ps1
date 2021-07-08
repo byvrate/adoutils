@@ -1,33 +1,29 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
 
 <#
 .Synopsis
     Generates a report in markdown on specific built in ADO groups. 
 
 .DESCRIPTION
-    Uses the Azure DevOps REST API to grab data and then aggregate that
-    and display the information as a markdown file. 
+    Generates a report in Markdown by using the results of the ADO 
+    REST API. It uses the results to capture specific organization
+    level metrics as well as iterate over all projects. 
 
-    The script specifically targets four built in groups:
+    The script specifically targets these built in groups:
     - "Project Administrators"
     - "Endpoint Administrators"
     - "Endpoint Creators"
     - "Build Administrators"
 
-    These groups are used to retrieve important metrics at the organization level. That 
-    is this script will iterate over all projects in the organization and look for these
-    built in groups. However, if these groups are modified and the permissions are altered, 
-    consideration must be taken into account.
-
 .PARAMETER Pat
-    Personal access token. This is a secure string. 
+    Personal access token as a secure string type.
 
-.PARAMETER Org
+.PARAMETER Organization
     The Azure DevOps organization.
 
 .PARAMETER Legacy
     Switch to indicate using the legacy REST api 
-    such as *.visualstudio.com
+    such as *.visualstudio.com (un-tested)
 
 .NOTES
     The following reference documentation was used:
@@ -42,204 +38,272 @@
 #>
 
 [CmdletBinding()]
-Param ( 
+param ( 
     [Security.SecureString][Parameter(Mandatory=$true)] $Pat,
-    [string][Parameter(Mandatory=$true)] $Org,
+    [string][Parameter(Mandatory=$true)] $Organization,
     [switch] $Legacy
 )
 
+Import-Module (Join-Path $PSScriptRoot "/markdownreport/Get-MarkdownReportHelpers.psm1") -DisableNameChecking
+
 $sw = [Diagnostics.Stopwatch]::StartNew()
 
-function New-MDNewLine {
-    param (
-        [int] $Count = 1
-    )
-    $newLineSymbol = [System.Environment]::NewLine
-    return $newLineSymbol * $Count
-}
 
-function New-MDPrimarySection {
-    param (
-        [string][Parameter(Mandatory=$true)] $Org,
-        [int][Parameter(Mandatory=$true)] $TotalProjectCount
+function Get-GroupUniqueTotalUserCount 
+{
+    [CmdletBinding()]
+    param 
+    (
+        [string][Parameter(Mandatory=$true)] $GroupName,
+        [Parameter(Mandatory=$true)] $Groups
     )
 
-    $newSection = "# Azure DevOps Group Membership Report"
-    $newSection += New-MDNewLine -Count 2
-    $newSection += "- This file was generated: {0}" -f $(Get-Date -AsUTC)
-    $newSection += New-MDNewLine
-    $newSection += "- Azure DevOps Organization: {0}" -f $Org
-    $newSection += New-MDNewLine
-    $newSection += "- Number of project in the organization: {0}" -f $TotalProjectCount
-    $newSection += New-MDNewLine -Count 2
+    [System.Collections.ArrayList]$totalUserInGroup = @()
 
-    return $newSection
+    $Groups | Where-Object { $_.principalName -match $GroupName } | ForEach-Object {
+        Write-Verbose "Found group $_ that matches group name $GroupName"
+
+        # It's assumed that a user collection is hanging off 
+        # the _users property that was set in this script
+        $intermediateUsers = $_._users
+        $totalUserInGroup += $intermediateUsers
+    }
+
+    if ($totalUserInGroup.Count -eq 0)
+    {
+        Write-Warning "There are no users found in group $GroupName"
+    }
+
+    # You need to sort first before calling Get-Unique
+    [array]$uniqueUsers = $($totalUserInGroup.ToArray()) | Sort-Object | Get-Unique
+
+    return $uniqueUsers.Count
 }
 
-function New-MDCaveatSection {
-    $newSection = "## Caveats"
-    $newSection += New-MDNewLine -Count 2
-    $newSection += "- The following report queries the default groups, so if any permission modifications are made to these groups, this report won't reflect that."
-    $newSection += New-MDNewLine
-    $newSection += "- This report doesn't capture organization level groups"
-    $newSection += New-MDNewLine
-    $newSection += "- This report doesn't list out names of individuals"
-    $newSection += New-MDNewLine
-    $newSection += "- The following built in project level Azure DevOps groups are included in the report:"
-    $newSection += New-MDNewLine
-    $newSection += "  - Project Administrators"
-    $newSection += New-MDNewLine -Count 2
-    $newSection += "  - Endpoint Administrators"
-    $newSection += New-MDNewLine -Count 2
-    $newSection += "  - Endpoint Creators"
-    $newSection += New-MDNewLine -Count 2
-    $newSection += "  - Build Administrators"
-    $newSection += New-MDNewLine -Count 2
-
-    return $newSection
-}
-
-function New-MDOrganizationSummarySection {
-    param (
-        [int][Parameter(Mandatory=$true)] $TotalProjectCount,
-        [int][Parameter(Mandatory=$true)] $TotalUniqueProjectAdminCount,
-        [int][Parameter(Mandatory=$true)] $TotalUniqueEndpointAdminCount,
-        [int][Parameter(Mandatory=$true)] $TotalUniqueEndpointCreatorCount,
-        [int][Parameter(Mandatory=$true)] $TotalUniqueBuildAdminCount
+function Get-RestCallWithContinuationTokenResult 
+{
+    [CmdletBinding()]
+    param 
+    (
+        [string][Parameter(Mandatory=$true)] $Uri,
+        [string] $Method = "Get",
+        [Parameter(Mandatory=$true)] $Header
     )
 
-    $newSection = "## Organization Summary"
-    $newSection += New-MDNewLine -Count 2
-    $newSection += "- Total count of projects queried: {0}" -f $TotalProjectCount
-    $newSection += New-MDNewLine
-    $newSection += "- Total count of unique members the Project Administrators: {0}" -f $TotalUniqueProjectAdminCount
-    $newSection += New-MDNewLine
-    $newSection += "- Total count of unique members the Endpoint Administrators: {0}" -f $TotalUniqueEndpointAdminCount
-    $newSection += New-MDNewLine
-    $newSection += "- Total count of unique members the Endpoint Creators: {0}" -f $TotalUniqueEndpointCreatorCount
-    $newSection += New-MDNewLine
-    $newSection += "- Total count of unique members the Build Administrators: {0}" -f $TotalUniqueBuildAdminCount
-    $newSection += New-MDNewLine -Count 2
+    $result = Invoke-RestMethod -Uri $Uri -Method $Method -ResponseHeadersVariable responseHeaders -ContentType "application/json" -Headers $Header
+    $continuationToken = $responseHeaders["X-MS-ContinuationToken"]
+    $iterationCount = 0
+    $iteationCountLimit = 10
+    while ($continuationToken -and $($iterationCount -lt $iteationCountLimit)) {
+        $uriWithContinuationToken = $Uri + "&ContinuationToken=$continuationToken"
+        $pagedResult = Invoke-RestMethod -Uri $uriWithContinuationToken -Method $Method -ResponseHeadersVariable responseHeaders -ContentType "application/json" -Headers $Header
+        if ($pagedResult) {
+            $result.value += $pagedResult.value
+            $result.count += $pagedResult.count
+        }
+        $continuationToken = $responseHeaders["X-MS-ContinuationToken"]
+        Write-Verbose "Response had $($pagedResult.count)"
+        $iterationCount++
+    }
+    if ($iterationCount -gt ($iteationCountLimit - 1)) {
+        Write-Warning "Ran out of retries on finding paged groups. Results may be inaccurate."
+    }
 
-    return $newSection
+    return $result
 }
 
-function New-MDItemizedProjectSection {
-    param (
-        [System.Array][Parameter(Mandatory=$true)] $Projects
+function Get-UsersInGroup 
+{
+    [CmdletBinding()]
+    param 
+    (
+        [Parameter(Mandatory=$true)] $Group
     )
 
-    $newSection = "## Itemized Azure DevOps Projects"
-    $newSection += New-MDNewLine -Count 2
-    $newSection += "The following is an itemized list of Azure DevOps projects with the groups listed out as well as other metrics."
-    $newSection += New-MDNewLine -Count 2
-    $newSection += "---" 
-    $newSection += New-MDNewLine -Count 2
+    Write-Host "Getting all unique users in group principle $($Group.principalName)"
+
+    if ($($Group.principalName) -eq "[NFCUDEVTEST]\Project Administrators") {
+        Write-Host "Stop here"
+    }
+
+    [System.Collections.ArrayList]$userPrincipleNames = @()
+
+    $memberShipUri = "https://{0}/_apis/graph/Memberships/{1}?api-version={2}&direction=down" -f $graphServer, $($Group.descriptor), "6.1-preview.1"
+
+    $retries = 3
+    $retrycount = 0
+    $completed = $false
+    while (-not $completed) {
+        try {
+            $membershipsResult = Invoke-RestMethod -Uri $memberShipUri -Method Get -ContentType "application/json" -Headers $header
+            $completed = $true
+        } catch {
+            if ($retrycount -ge $retries) {
+                Write-Verbose ("Command Invoke-RestMethod failed the maximum number of {0} times." -f $retrycount)
+                throw
+            } else {
+                Write-Verbose "Command Invoke-RestMethod failed. Retrying in 2 seconds."
+                Start-Sleep 2
+                $retrycount++
+            }
+        }
+    }
+    Write-Host "Group memberships found: $($membershipsResult.count)"
+
+    $membershipsResult.value | ForEach-Object {
+        # Subject / User Lookup
+        Write-Host "`tFind user based on descriptor: $($_.memberDescriptor)"
+
+        $body= @{
+            'lookupKeys' = @(@{'descriptor' = "$($_.memberDescriptor)" })
+                } | ConvertTo-Json
+        $lookupSubjectUri = "https://{0}/_apis/graph/subjectlookup?api-version={1}" -f $graphServer, "6.1-preview.1"
+
+        $retries = 3
+        $retrycount = 0
+        $completed = $false
+        while (-not $completed) {
+            try {
+                $lookupSubjectsResult = Invoke-RestMethod -Uri $lookupSubjectUri -Method Post -ContentType "application/json" -Body $body -Headers $header
+                $completed = $true
+            } catch {
+                if ($retrycount -ge $retries) {
+                    Write-Verbose ("Command Invoke-RestMethod failed the maximum number of {0} times." -f $retrycount)
+                    throw
+                } else {
+                    Write-Verbose "Command Invoke-RestMethod failed. Retrying in 2 seconds."
+                    Start-Sleep 2
+                    $retrycount++
+                }
+            }
+        }
+
+        $lookupSubjectValue = $lookupSubjectsResult.value.$($_.memberDescriptor)
+    
+        if ($lookupSubjectValue.subjectKind -eq "user") {
+            Write-Verbose "Adding user $($lookupSubjectValue.displayName) to users list"
+            $userPrincipleNames.Add($lookupSubjectValue.principalName)
+        } elseif ($lookupSubjectValue.subjectKind -eq "group") {
+            $foundUserInGroup = $null
+            $foundUserInGroup = Get-UsersInGroup -Group $lookupSubjectValue # recursive call
+            if ($foundUserInGroup) {
+                $foundUserInGroup = $foundUserInGroup[$foundUserInGroup.length - 1]
+                $userPrincipleNames += $foundUserInGroup
+            }
+        } else {
+            Write-Warning "{0} is not handled by this script." -f $($lookupSubjectValue.subjectKind)
+        }
+    }
+
+    [array]$uniqueUsers = $($userPrincipleNames.ToArray()) | Sort-Object | Get-Unique
+    return (, $uniqueUsers)
+}
+
+function New-MDItemizedProjectSectionAdoPermissionsReport  
+{
+
+    [CmdletBinding()]
+    param 
+    (
+        [Parameter(Mandatory=$true)] $Projects,
+        [Parameter(Mandatory=$true)] $FilteredGroups
+    )
+
+    $section = "## Itemized Azure DevOps Projects"
+    $section += New-MDNewLine -Count 2
+    $section += "Itemized list of Azure DevOps projects with the groups metrics."
+    $section += New-MDNewLine -Count 2
+    $section += "---" 
+    $section += New-MDNewLine -Count 2
 
     $Projects | ForEach-Object { 
 
-        $projectAdminCount = Get-GroupUserCount -ProjectName $_.name -GroupName "Project Administrators"
-        $endpointAdminCount = Get-GroupUserCount -ProjectName $_.name -GroupName "Endpoint Administrators"
-        $endpointCreatorCount = Get-GroupUserCount -ProjectName $_.name -GroupName "Endpoint Creators"
-        $buildAdminCount = Get-GroupUserCount -ProjectName $_.name -GroupName "Build Administrators"
+        $projectAdminCount = Get-GroupUserCount -ProjectName $_.name -Groups $FilteredGroups  -GroupName "Project Administrators"
+        $endpointAdminCount = Get-GroupUserCount -ProjectName $_.name -Groups $FilteredGroups -GroupName "Endpoint Administrators"
+        $endpointCreatorCount = Get-GroupUserCount -ProjectName $_.name -Groups $FilteredGroups -GroupName "Endpoint Creators"
+        $buildAdminCount = Get-GroupUserCount -ProjectName $_.name -Groups $FilteredGroups -GroupName "Build Administrators"
 
-        $newSection += "### {0}" -f $_.name
-        $newSection += New-MDNewLine -Count 2
+        $section += "### {0}" -f $_.name
+        $section += New-MDNewLine -Count 2
         if ($_.description) {
-            $newSection += $_.description
-            $newSection += New-MDNewLine -Count 2
+            $section += "{0} {1}" -f ">", $_.description
+            $section += New-MDNewLine -Count 2
         } else {
-            $newSection += "_No description available for this project._"
-            $newSection += New-MDNewLine -Count 2
+            $section += "> _No description available for this project._"
+            $section += New-MDNewLine -Count 2
         }
-        $newSection += "- Id: {0}" -f $_.id
-        $newSection += New-MDNewLine
-        $newSection += "- Url: [{0}]({0})" -f $_.url
-        $newSection += New-MDNewLine
-        $newSection += "- Project Administrators user count: {0}" -f $projectAdminCount 
-        $newSection += New-MDNewLine
-        $newSection += "- Endpoint Administrators user count: {0}"  -f $endpointAdminCount
-        $newSection += New-MDNewLine
-        $newSection += "- Endpoint Creators user count: {0}" -f $endpointCreatorCount
-        $newSection += New-MDNewLine
-        $newSection += "- Build Administrators: {0}" -f $buildAdminCount
-        $newSection += New-MDNewLine -Count 2
-        $newSection += "---" 
-        $newSection += New-MDNewLine -Count 2
+        $section += "- Id: {0}" -f $_._projectmetadata.id
+        $section += New-MDNewLine
+        $section += "- Url: [{0}]({1})" -f $($_._projectmetadata._links.web.href), $($_._projectmetadata._links.web.href.Replace(' ', '%20'))
+        $section += New-MDNewLine
+        $section += "- Project Administrators user count: {0}" -f $projectAdminCount 
+        $section += New-MDNewLine
+        $section += "- Endpoint Administrators user count: {0}"  -f $endpointAdminCount
+        $section += New-MDNewLine
+        $section += "- Endpoint Creators user count: {0}" -f $endpointCreatorCount
+        $section += New-MDNewLine
+        $section += "- Build Administrators: {0}" -f $buildAdminCount
+        $section += New-MDNewLine -Count 2
+        $section += "---" 
+        $section += New-MDNewLine -Count 2
     }
-    return $newSection
+    return $section
 }
 
-function Get-GroupUserCount {
-    param (
-        [string] $ProjectName,
-        [string] $GroupName
+function Get-GroupUserCount 
+{
+    [CmdletBinding()]
+    param 
+    (
+        [string][Parameter(Mandatory=$true)] $ProjectName,
+        [Parameter(Mandatory=$true)] $Groups,
+        [string][Parameter(Mandatory=$true)] $GroupName
     )
 
     $userCount = 0
-    # Find the group based on the principleName
-    $generatedPrincipleName = "[{0}]\{1}" -f $ProjectName, $GroupName
-
-    [array]$foundGroup = $filteredGroups | Where-Object { $_.principalName -eq $generatedPrincipleName }
+    # Find the group based on the principalName
+    $generatedPrincipalName = "[{0}]\{1}" -f $ProjectName, $GroupName
+    Write-Verbose "Finding group based on principal name $generatedPrincipalName"
+    [array]$foundGroup = $Groups | Where-Object { $_.principalName -eq $generatedPrincipalName }
+    Write-Verbose "Found $($foundGroup.length) group(s) based on principle name $generatedPrincipalName"
     if ($foundGroup.Length -eq 1) {
         $userCount = $foundGroup[0]._users.Count 
     } else {
-        Write-Warning "An exact match for group '$GroupName' in project '$ProjectName' was not found"
+        Write-Warning "An exact match for group '$GroupName' in project '$ProjectName' was not found. A user acount of zero will be returned."
     }
     return $userCount
 }
 
-function Get-GroupUniqueTotalUserCount {
-    param (
-        [string] $GroupName
-    )
-
-    $usersFound = @()
-
-    $filteredGroups | Where-Object { $_.principalName -match $GroupName } | ForEach-Object {
-        $usersHashTable = $_._users
-
-        $usersHashTable.Keys | ForEach-Object {
-            $value = $usersHashTable.Item($_)
-            $usersFound += $value.principalName
-        }
+    $coreServer = "dev.azure.com/{0}" -f $Organization
+    if ($Legacy) {
+        $coreServer = "{0}.visualstudio.com" -f $Organization
     }
+    $graphServer = "vssps.{0}" -f $coreServer
 
-    [array]$uniqueUsers = $usersFound | Sort-Object | Get-Unique
-    return $uniqueUsers.Length
-}
+    Write-Host "Generating PAT token"
+    $encodedPat = [System.Text.Encoding]::ASCII.GetBytes($("{0}:{1}" -f "", $(ConvertFrom-SecureString -SecureString $Pat -AsPlainText)))
+    $token = [System.Convert]::ToBase64String($encodedPat)
+    $header = @{authorization = "Basic $token"}
 
-$coreServer = "dev.azure.com/{0}" -f $Org
-if ($Legacy) {
-    $coreServer = "{0}.visualstudio.com" -f $Org
-}
-$graphServer = "vssps.{0}" -f $coreServer
-
-Write-Host "Generating PAT token"
-$encodedPat = [System.Text.Encoding]::ASCII.GetBytes($("{0}:{1}" -f "", $(ConvertFrom-SecureString -SecureString $Pat -AsPlainText)))
-$token = [System.Convert]::ToBase64String($encodedPat)
-$header = @{authorization = "Basic $token"}
-
-Write-Host "Retrieving all Group in org $Org"
+Write-Host "Retrieving all the groups in the organization"
 $groupsUri = "https://{0}/_apis/graph/groups?api-version={1}" -f $graphServer, "6.1-preview.1"
-$groupsResult = Invoke-RestMethod -Uri $groupsUri -Method Get -ContentType "application/json" -Headers $header
+$groupsResult = Get-RestCallWithContinuationTokenResult -Uri $groupsUri -Header $header -ErrorAction Stop
 
-Write-Host "Retrieving all Projects in org $Org"
+Write-Host "Retrieving all Projects in organization"
 $projectsUri = "https://{0}/_apis/projects?api-version={1}" -f $coreServer, "6.0"
-$projectsResult = Invoke-RestMethod -Uri $projectsUri -Method Get -ContentType "application/json" -Headers $header
+$projectsResult = Get-RestCallWithContinuationTokenResult -Uri $projectsUri -Header $header -ErrorAction Stop
 
-Write-Host "Retrieving all Users in org $Org"
+Write-Host "Retrieving all Users in the organization"
 $usersUri = "https://{0}/_apis/graph/users?api-version={1}" -f $graphServer, "6.1-preview.1"
-$usersResult = Invoke-RestMethod -Uri $usersUri -Method Get -ContentType "application/json" -Headers $header
+$usersResult = Get-RestCallWithContinuationTokenResult -Uri $usersUri -Header $header -ErrorAction Stop
 
-# Filtering / grouping users based on criteria (user type and origin)
-$allUsersGroupByOrigin = $usersResult.value | Group-Object -Property origin
+Write-Host "Filtering / grouping users based on criteria (user type and origin)"
 $allUsers = $usersResult.value | Where-Object { $_.subjectKind -eq "user" }
 $aadUsers = $usersResult.value | Where-Object { $_.subjectKind -eq "user" -and $_.origin -eq "ad" }         # Windows Active Directory
 $adUsers = $usersResult.value | Where-Object { $_.subjectKind -eq "user" -and $_.origin -eq "aad" }         # Azure Active Directory
 $msaUsers = $usersResult.value | Where-Object { $_.subjectKind -eq "user" -and $_.origin -eq "msa" }        # Windows Live Account
 $vstsUsers = $usersResult.value | Where-Object { $_.subjectKind -eq "user" -and $_.origin -eq "vsts" }      # DevOps
-$importedUsers = $usersResult.value | Where-Object { $_.subjectKind -eq "user" -and $_.origin -eq "ghb" }   # GitHub
+$gitHubUsers = $usersResult.value | Where-Object { $_.subjectKind -eq "user" -and $_.origin -eq "ghb" }     # GitHub
 
 Write-Host "Filtering groups by group name: Endpoint Administrators, Project Administrators, Build Administrators, and Endpoint Creators"
 $groupDisplayNameFilter = @("Endpoint Administrators", "Project Administrators", "Build Administrators", "Endpoint Creators")
@@ -247,13 +311,13 @@ $filteredGroups = $groupsResult.value | Where-Object {
     ($_.displayName -in $groupDisplayNameFilter)
 }
 
-# User Metrics
+# Organization level user metrics
 $totalUsers = $allUsers.count
-$totalWindowsActiveDirectoryUsers = $allUsersGroupByOrigin | Where-Object { $_.Name -eq "ad"} | Select-Object -Property Count
-$totalAzureActiveDirectoryUsers = $allUsersGroupByOrigin | Where-Object { $_.Name -eq "aad"} | Select-Object -Property Count
-$totalMsaUsers = $allUsersGroupByOrigin | Where-Object { $_.Name -eq "msa"} | Select-Object -Property Count
-$totalDevOpsUsers = $allUsersGroupByOrigin | Where-Object { $_.Name -eq "vsts"} | Select-Object -Property Count
-$totalGitHubUsers = $allUsersGroupByOrigin | Where-Object { $_.Name -eq "ghb"} | Select-Object -Property Count
+$totalWindowsActiveDirectoryUsers = $adUsers.count ?? 0
+$totalAzureActiveDirectoryUsers = $aadUsers.count ?? 0
+$totalMsaUsers = $msaUsers.count ?? 0
+$totalDevOpsUsers = $vstsUsers.count ?? 0
+$totalGitHubUsers = $gitHubUsers.count ?? 0
 
 # Project Metrics
 $totalProjectCount = $projectsResult.count
@@ -261,54 +325,45 @@ $totalProjectCount = $projectsResult.count
 # Iterate through all groups to identify group metrics
 Write-Host "Retrieving over all ADO Group memberships"
 $filteredGroups | ForEach-Object {
-    $users = @{}
-
-    Write-Host "$($_.principalName)"
-    $memberShipUri = "https://{0}/_apis/graph/Memberships/{1}?api-version={2}&direction=down" -f $graphServer, $($_.descriptor), "6.1-preview.1"
-    $membershipsResult = Invoke-RestMethod -Uri $memberShipUri -Method Get -ContentType "application/json" -Headers $header
-    Write-Host "Group memberships found: $($membershipsResult.count)"
-
-    $membershipsResult.value | ForEach-Object {
-        # Subject / User Lookup
-        Write-Host "Find user based on descriptor: $($_.memberDescriptor)"
-
-        $body= @{
-            'lookupKeys' = @(@{'descriptor' = "$($_.memberDescriptor)" })
-                } | ConvertTo-Json
-        $lookupSubjectUri = "https://{0}/_apis/graph/subjectlookup?api-version={1}" -f $graphServer, "6.1-preview.1"
-        $lookupSubjectsResult = Invoke-RestMethod -Uri $lookupSubjectUri -Method Post -ContentType "application/json" -Body $body -Headers $header
-        $lookupSubjectValue = $lookupSubjectsResult.value.$($_.memberDescriptor)
-
-        if ($lookupSubjectValue.subjectKind -eq "user") {
-            Write-Host $lookupSubjectValue
-            $users[$($_.memberDescriptor)] = $lookupSubjectValue
-        }
+    Write-Host "Get users in group $_"
+    $usersInGroupResult = Get-UsersInGroup -Group $_ -ErrorAction Stop
+    if ($usersInGroupResult -and $usersInGroupResult.length -gt 0) {
+        [array]$usersInGroup = $usersInGroupResult[$usersInGroupResult.length - 1]
+        Add-Member -InputObject $_ -NotePropertyName _users -NotePropertyValue $usersInGroup -Force
     }
-
-    Write-Host "Found '$($users.count)' user(s) in group '$($_.principalName)'"
-    Add-Member -InputObject $_ -NotePropertyName _users -NotePropertyValue $users -Force
 }
 
 # Iterate through all projects to get metadata
-Write-Host "Retrieving over all ADO projects"
+Write-Host "Retrieving all projects to report metadata"
 $projectsResult.value | ForEach-Object {
-    $projectUri = "https://{0}/_apis/projects/{1}?api-version={2}" -f $coreServer, $($_.id), "6.1-preview.1"
-    $projectResult = Invoke-RestMethod -Uri $projectUri -Method Get -ContentType "application/json" -Headers $header
+    $projectResult = Invoke-RestMethod -Uri $($_.url) -Method Get -ContentType "application/json" -Headers $header
     Write-Host "Retrieved project meta data for $($_.name)"
     Add-Member -InputObject $_ -NotePropertyName _projectmetadata -NotePropertyValue $projectResult -Force
 }
 
 # Group Metrics
-$totalUniqueProjectAdminCount = Get-GroupUniqueTotalUserCount -GroupName "Project Administrators"
-$totalUniqueEndpointAdminCount = Get-GroupUniqueTotalUserCount -GroupName "Endpoint Administrators"
-$totalUniqueEndpointCreatorCount = Get-GroupUniqueTotalUserCount -GroupName "Endpoint Creators"
-$totalUniqueBuildAdminCount = Get-GroupUniqueTotalUserCount -GroupName "Build Administrators"
+$totalUniqueProjectAdminCount = Get-GroupUniqueTotalUserCount -GroupName "Project Administrators" -Groups $filteredGroups
+$totalUniqueEndpointAdminCount = Get-GroupUniqueTotalUserCount -GroupName "Endpoint Administrators" -Groups $filteredGroups
+$totalUniqueEndpointCreatorCount = Get-GroupUniqueTotalUserCount -GroupName "Endpoint Creators" -Groups $filteredGroups
+$totalUniqueBuildAdminCount = Get-GroupUniqueTotalUserCount -GroupName "Build Administrators" -Groups $filteredGroups
 
 $markdown = ""
-$markdown += New-MDPrimarySection -Org $Org -TotalProjectCount $totalProjectCount
-$markdown += New-MDCaveatSection
-$markdown += New-MDOrganizationSummarySection -TotalProjectCount $totalProjectCount -TotalUniqueProjectAdminCount $totalUniqueProjectAdminCount -TotalUniqueEndpointAdminCount $totalUniqueEndpointAdminCount -TotalUniqueEndpointCreatorCount $totalUniqueEndpointCreatorCount -TotalUniqueBuildAdminCount $totalUniqueBuildAdminCount
-$markdown += New-MDItemizedProjectSection -Project $($projectsResult.value)
+$markdown += New-MDPrimarySectionAdoPermissionsReport  -Organization $Organization -TotalProjectCount $totalProjectCount
+$markdown += New-MDCaveatSectionAdoPermissionsReport
+$markdown += New-MDOrganizationSummarySectionAdoGroupAdoPermissionsReport  `
+    -TotalUserCount $totalUsers `
+    -TotalAadUserCount $totalAzureActiveDirectoryUsers `
+    -TotalAdUserCount $totalWindowsActiveDirectoryUsers `
+    -TotalLiveAccountUserCount $totalMsaUsers `
+    -TotalDevOpsUserCount $totalDevOpsUsers `
+    -TotalGitHubUserCount $totalGitHubUsers `
+    -TotalProjectCount $totalProjectCount `
+    -TotalUniqueProjectAdminCount $totalUniqueProjectAdminCount `
+    -TotalUniqueEndpointAdminCount $totalUniqueEndpointAdminCount `
+    -TotalUniqueEndpointCreatorCount $totalUniqueEndpointCreatorCount `
+    -TotalUniqueBuildAdminCount $totalUniqueBuildAdminCount 
+
+$markdown += New-MDItemizedProjectSectionAdoPermissionsReport -Projects $($projectsResult.value) -FilteredGroups $filteredGroups
 
 New-Item -Path . -Name "$((New-Guid).Guid).md" -ItemType "file" -Value $markdown
 
