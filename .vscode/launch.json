@@ -18,6 +18,14 @@
             "script": "${file}",
             "cwd": "${file}",
             "args": ["-Org byvrate -Pat $patss"]
+        },
+        {
+            "name": "New-ProcessTemplateReport.ps1",
+            "type": "PowerShell",
+            "request": "launch",
+            "script": "${file}",
+            "cwd": "${file}",
+            "args": ["-Organization byvrate -Pat $Pat"]
         }
     ]
 }
