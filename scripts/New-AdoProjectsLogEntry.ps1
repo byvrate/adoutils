@@ -1,8 +1,3 @@
-# This script uses a personal access token (PAT) but the type used is a secure string. 
-# In order to pass this type in you can to convert the PAT to a secure string. Use this snippet of script:
-# $Pat = ConvertTo-SecureString -String "ExamplePAT" -AsPlainText -Force
-
-
 #Requires -Version 7.0
 
 <#
@@ -50,6 +45,10 @@ param (
     [switch] $Legacy
 )
 
+# https://docs.microsoft.com/en-us/azure/azure-monitor/logs/log-standard-columns#timegenerated
+# Time generated field based on UTC ISO 8601
+$TimeStampField = Get-Date ((Get-Date).ToUniversalTime()) -Format "o"
+Write-Host "TimeGenerated " + $TimeStampField
 function Get-RestCallWithContinuationTokenResult 
 {
     [CmdletBinding()]
@@ -100,7 +99,7 @@ Function Build-Signature ($customerId, $sharedKey, $date, $contentLength, $metho
 }
 
 
-Function Post-LogAnalyticsData($customerId, $sharedKey, $body, $logType)
+Function Submit-LogAnalyticsData($customerId, $sharedKey, $body, $logType)
 {
     $method = "POST"
     $contentType = "application/json"
@@ -126,7 +125,6 @@ Function Post-LogAnalyticsData($customerId, $sharedKey, $body, $logType)
 
     $response = Invoke-WebRequest -Uri $uri -Method $method -ContentType $contentType -Headers $headers -Body $body -UseBasicParsing
     return $response.StatusCode
-
 }
 
 $coreServer = "dev.azure.com/{0}" -f $Organization
@@ -147,5 +145,5 @@ $projectsResult = Get-RestCallWithContinuationTokenResult -Uri $projectsUri -Hea
 # Log all JSON data to Log Analytics (Azure Monitor Logs) workspace
 # Specify the name of the record type that you'll be creating
 $logType = "{0}AdoProjectType" -f $Organization
-$jsonValue = $projectsResult.value | ConvertTo-Json
-Post-LogAnalyticsData -customerId $WorkspaceId -sharedKey $WorkspaceSharedKey -body ($jsonValue) -logType $logType
+$jsonValue = $projectsResult.value | ConvertTo-Json -Depth 10
+Submit-LogAnalyticsData -customerId $WorkspaceId -sharedKey $WorkspaceSharedKey -body ($jsonValue) -logType $logType
